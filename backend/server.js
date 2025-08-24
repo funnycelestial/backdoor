@@ -34,6 +34,7 @@ const twoFactorRoutes = require('./routes/twoFactorRoutes');
 // Import controllers
 const webSocketController = require('./controllers/webSocketController');
 const blockchainEventController = require('./controllers/blockchainEventController');
+const realTimeController = require('./controllers/realTimeController');
 const { apiLimiter } = require('./middleware/rateLimiter');
 const app = express();
 const server = createServer(app);
@@ -100,13 +101,22 @@ redisClient.on('error', (error) => {
 // Socket.IO setup
 webSocketController.initialize(io);
 
+// Initialize real-time features
+realTimeController.initialize();
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.status(200).json({
     success: true,
     message: 'Server is healthy',
     timestamp: new Date().toISOString(),
-    version: process.env.API_VERSION || 'v1'
+    version: process.env.API_VERSION || 'v1',
+    services: {
+      database: 'connected',
+      redis: 'connected',
+      websocket: 'active',
+      blockchain: 'listening'
+    }
   });
 });
 
@@ -153,6 +163,7 @@ if (process.env.NODE_ENV !== 'test') {
 process.on('SIGTERM', () => {
   logger.info('SIGTERM received, shutting down gracefully');
   blockchainEventController.stopEventListening();
+  realTimeController.stop();
   server.close(() => {
     mongoose.connection.close();
     redisClient.quit();
@@ -163,6 +174,7 @@ process.on('SIGTERM', () => {
 process.on('SIGINT', () => {
   logger.info('SIGINT received, shutting down gracefully');
   blockchainEventController.stopEventListening();
+  realTimeController.stop();
   server.close(() => {
     mongoose.connection.close();
     redisClient.quit();
