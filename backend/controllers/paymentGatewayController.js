@@ -1,71 +1,106 @@
 // controllers/paymentGatewayController.js
-import PaymentGateway from '../models/paymentGatewayModel.js';
-import TokenTransaction from '../models/tokentransactionModel.js';
-import User from '../models/userModel.js';
-import { processPayment, processPayout } from '../services/paymentProcessors.js';
-import { notifyUser } from '../services/notificationService.js';
+const mongoose = require('mongoose');
+const TokenTransaction = require('../models/tokenTransactionModel');
+const User = require('../models/userModel');
+const mobileMoneyController = require('./mobileMoneyController');
+const notificationService = require('../services/notificationService');
+const webSocketController = require('./webSocketController');
+const logger = require('../utils/logger');
+const { asyncHandler } = require('../middleware/errorHandler');
 
 // Constants
 const TOKEN_RATE = 5; // 1 GHS = 5 tokens (adjust based on your economy)
 const SELL_RATE = 0.18; // 1 token = 0.18 GHS when cashing out
 
-// 1. Initiate Token Purchase
-export const buyTokens = async (req, res) => {
+// @route   POST /api/v1/payments/buy-tokens
+// @desc    Buy tokens with mobile money integration
+// @access  Private
+const buyTokens = asyncHandler(async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
 
-  try {
-    const { method, amountFiat } = req.body;
-    const amountTokens = amountFiat * TOKEN_RATE;
+  const { paymentMethod, amount, phoneNumber } = req.body;
+  const userId = req.user.userId;
 
-    // Create payment record
-    const payment = await PaymentGateway.create([{
-      user: req.user.id,
-      type: 'BUY_TOKENS',
-      method,
-      amountFiat,
-      amountTokens,
-      status: 'PENDING',
-      transactionRef: `init_${Date.now()}`
-    }], { session });
-
-    // Initiate payment with processor
-    const paymentResult = await processPayment({
-      userId: req.user.id,
-      method,
-      amount: amountFiat,
-      reference: payment[0].transactionRef
-    });
-
-    if (!paymentResult.success) {
-      await session.abortTransaction();
-      return res.status(400).json({ message: paymentResult.error });
-    }
-
-    // Update payment record with processor reference
-    await PaymentGateway.updateOne(
-      { _id: payment[0]._id },
-      { transactionRef: paymentResult.processorId },
-      { session }
-    );
-
-    await session.commitTransaction();
-
-    res.json({
-      paymentId: payment[0]._id,
-      nextAction: paymentResult.nextStep // e.g., "REDIRECT_TO_MOMO" or "CONFIRM_PAYMENT"
-    });
-
-  } catch (error) {
+  // Validate payment method
+  const validMethods = ['mtn_momo', 'vodafone_cash', 'airteltigo', 'telecel_cash'];
+  if (!validMethods.includes(paymentMethod)) {
     await session.abortTransaction();
-    res.status(500).json({ 
-      message: 'Payment initiation failed: ' + error.message,
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid payment method',
+      data: null
     });
-  } finally {
-    session.endSession();
   }
-};
+
+  // Validate phone number for mobile money
+  if (paymentMethod.includes('momo') || paymentMethod.includes('cash')) {
+    const phoneValidation = mobileMoneyController.validatePhoneNumber(paymentMethod, phoneNumber);
+    if (!phoneValidation.isValid) {
+      await session.abortTransaction();
+      return res.status(400).json({
+        success: false,
+        message: phoneValidation.error,
+        data: null
+      });
+    }
+  }
+
+  // Check daily limits
+  const limitCheck = await mobileMoneyController.checkDailyLimit(userId, paymentMethod, amount);
+  if (limitCheck.exceeded) {
+    await session.abortTransaction();
+    return res.status(400).json({
+      success: false,
+      message: `Daily limit exceeded. Remaining: ${limitCheck.remaining} GHS`,
+      data: limitCheck
+    });
+  }
+
+  // Generate reference
+  const reference = `WKC_${Date.now()}_${userId.slice(-6)}`;
+
+  // Initiate mobile money payment
+  const paymentResult = await mobileMoneyController.initiatePayment(
+    paymentMethod,
+    phoneNumber,
+    amount,
+    reference,
+    userId
+  );
+
+  if (!paymentResult.success) {
+    await session.abortTransaction();
+    return res.status(400).json({
+      success: false,
+      message: 'Payment initiation failed',
+      data: null
+    });
+  }
+
+  await session.commitTransaction();
+
+  // Send real-time update
+  webSocketController.sendToUser(userId, 'payment_initiated', {
+    type: 'token_purchase',
+    amount,
+    paymentMethod,
+    transactionId: paymentResult.transactionId,
+    nextStep: paymentResult.nextStep
+  });
+
+  res.json({
+    success: true,
+    message: 'Token purchase initiated',
+    data: {
+      transactionId: paymentResult.transactionId,
+      amount: paymentResult.amount,
+      fee: paymentResult.fee,
+      nextStep: paymentResult.nextStep,
+      estimatedCompletion: '2-5 minutes'
+    }
+  });
+});
 
 // 2. Confirm Token Purchase (Webhook Handler)
 export const confirmPurchase = async (processorId, amountReceived) => {
@@ -296,4 +331,9 @@ export const updateTransactionStatus = async (req, res) => {
   } finally {
     session.endSession();
   }
+};
+
+module.exports = {
+  buyTokens,
+  // ... other exports
 };

@@ -28,7 +28,13 @@ const disputeRoutes = require('./routes/disputeRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
 const securityRoutes = require('./routes/securityRoutes');
 const adminRoutes = require('./routes/adminRoutes');
+const webhookRoutes = require('./routes/webhookRoutes');
+const twoFactorRoutes = require('./routes/twoFactorRoutes');
 
+// Import controllers
+const webSocketController = require('./controllers/webSocketController');
+const blockchainEventController = require('./controllers/blockchainEventController');
+const { apiLimiter } = require('./middleware/rateLimiter');
 const app = express();
 const server = createServer(app);
 const io = new Server(server, {
@@ -39,16 +45,22 @@ const io = new Server(server, {
 });
 
 // Security middleware
-app.use(helmet());
+app.use(helmet({
+  crossOriginEmbedderPolicy: false,
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+      connectSrc: ["'self'", "ws:", "wss:"]
+    }
+  }
+}));
 app.use(compression());
 
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
-  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100,
-  message: 'Too many requests from this IP, please try again later.'
-});
-app.use(limiter);
+// Apply rate limiting
+app.use('/api/', apiLimiter);
 
 // CORS configuration
 app.use(cors({
@@ -86,7 +98,7 @@ redisClient.on('error', (error) => {
 });
 
 // Socket.IO setup
-socketHandler(io);
+webSocketController.initialize(io);
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -101,6 +113,7 @@ app.get('/health', (req, res) => {
 // API routes
 const apiVersion = process.env.API_VERSION || 'v1';
 app.use(`/api/${apiVersion}/auth`, authRoutes);
+app.use(`/api/${apiVersion}/auth/2fa`, twoFactorRoutes);
 app.use(`/api/${apiVersion}/auctions`, auctionRoutes);
 app.use(`/api/${apiVersion}/users`, userRoutes);
 app.use(`/api/${apiVersion}/market`, marketRoutes);
@@ -113,7 +126,10 @@ app.use(`/api/${apiVersion}/disputes`, disputeRoutes);
 app.use(`/api/${apiVersion}/notifications`, notificationRoutes);
 app.use(`/api/${apiVersion}/security`, securityRoutes);
 app.use(`/api/${apiVersion}/admin`, adminRoutes);
+app.use(`/api/${apiVersion}/webhooks`, webhookRoutes);
 
+// Serve uploaded files
+app.use('/uploads', express.static('uploads'));
 // 404 handler
 app.use('*', (req, res) => {
   res.status(404).json({
@@ -126,9 +142,17 @@ app.use('*', (req, res) => {
 // Error handling middleware
 app.use(errorHandler);
 
+// Initialize blockchain event listening
+if (process.env.NODE_ENV !== 'test') {
+  blockchainEventController.initialize().catch(error => {
+    logger.error('Failed to initialize blockchain event controller:', error);
+  });
+}
+
 // Graceful shutdown
 process.on('SIGTERM', () => {
   logger.info('SIGTERM received, shutting down gracefully');
+  blockchainEventController.stopEventListening();
   server.close(() => {
     mongoose.connection.close();
     redisClient.quit();
@@ -138,6 +162,7 @@ process.on('SIGTERM', () => {
 
 process.on('SIGINT', () => {
   logger.info('SIGINT received, shutting down gracefully');
+  blockchainEventController.stopEventListening();
   server.close(() => {
     mongoose.connection.close();
     redisClient.quit();

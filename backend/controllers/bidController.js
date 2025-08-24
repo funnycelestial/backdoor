@@ -1,7 +1,13 @@
 // controllers/bidController.js
-import Bid from '../models/bidModel.js';
-import Auction from '../models/auctionModel.js';
-import User from '../models/userModel.js';
+const mongoose = require('mongoose');
+const Bid = require('../models/bidModel');
+const Auction = require('../models/auctionModel');
+const User = require('../models/userModel');
+const TokenTransaction = require('../models/tokenTransactionModel');
+const webSocketController = require('./webSocketController');
+const notificationService = require('../services/notificationService');
+const logger = require('../utils/logger');
+const { asyncHandler } = require('../middleware/errorHandler');
 
 // Constants for anti-sniping and fraud detection
 const ANTI_SNIPING_EXTENSION = 30; // Extend auction by 30 sec if last-minute bid
@@ -26,67 +32,233 @@ const escrowBidTokens = async (bid) => {
   }
 };
 
-//1. Merged placeBid function
-export const placeBid = async (req, res) => {
+// @route   POST /api/v1/auctions/:id/bids
+// @desc    Place bid with real-time updates and validation
+// @access  Private
+const placeBid = asyncHandler(async (req, res) => {
   let bid; // declare outside try for cleanup
-  try {
-    const { auctionId, amount } = req.body;
-    const userId = req.user.id;
+  const { amount, isAutoBid = false, maxAmount, increment } = req.body;
+  const auctionId = req.params.id;
+  const userId = req.user.userId;
 
-    // Validate auction and user existence
-    const [auction, user] = await Promise.all([
-      Auction.findById(auctionId),
-      User.findById(userId)
-    ]);
-    if (!auction || !auction.isActive || new Date() > auction.endTime) {
-      return res.status(400).json({ message: 'Bidding closed or auction not found' });
+  // Find auction
+  const auction = await Auction.findById(auctionId);
+  if (!auction) {
+    return res.status(404).json({
+      success: false,
+      message: 'Auction not found',
+      data: null
+    });
+  }
+
+  // Check if auction is active
+  if (auction.status !== 'active') {
+    return res.status(400).json({
+      success: false,
+      message: 'Auction is not active',
+      data: null
+    });
+  }
+
+  // Check if auction has ended
+  if (new Date() >= auction.timing.endTime) {
+    return res.status(400).json({
+      success: false,
+      message: 'Auction has ended',
+      data: null
+    });
+  }
+
+  // Check if user is not the seller
+  if (auction.seller.userId.toString() === userId) {
+    return res.status(400).json({
+      success: false,
+      message: 'Cannot bid on your own auction',
+      data: null
+    });
+  }
+
+  // Validate bid amount
+  const minBidAmount = auction.pricing.currentBid + (auction.bidding.bidIncrement || 1);
+  if (amount < minBidAmount) {
+    return res.status(400).json({
+      success: false,
+      message: `Bid must be at least ${minBidAmount} WKC`,
+      data: null
+    });
+  }
+
+  // Anti-spam: Check for rapid bidding
+  const lastUserBid = await Bid.findOne({ 
+    'bidder.userId': userId, 
+    'auction.auctionRef': auction._id 
+  }).sort({ 'timing.placedAt': -1 });
+  
+  if (lastUserBid && (Date.now() - lastUserBid.timing.placedAt.getTime()) < 5000) {
+    return res.status(429).json({
+      success: false,
+      message: 'Please wait 5 seconds between bids',
+      data: null
+    });
+  }
+
+  // Create bid
+  bid = new Bid({
+    auction: {
+      auctionId: auction.auctionId,
+      auctionRef: auction._id
+    },
+    bidder: {
+      userId: req.user.userId,
+      anonymousId: req.user.anonymousId,
+      walletAddress: req.user.walletAddress
+    },
+    amount,
+    autoBid: {
+      isAutoBid,
+      maxAmount,
+      increment,
+      isActive: isAutoBid
+    },
+    metadata: {
+      ipAddress: req.ip,
+      userAgent: req.get('User-Agent'),
+      bidSource: 'web'
+    },
+    validation: {
+      riskScore: amount > auction.pricing.currentBid * 2 ? 30 : 0,
+      flagged: amount > auction.pricing.currentBid * 3
     }
-    if (!user) return res.status(404).json({ message: 'User not found' });
+  });
 
-    // Bid amount and balance checks
-    const minValidBid = auction.currentPrice * (1 + FRAUD_RULES.MIN_BID_INCREASE);
-    if (amount < minValidBid) {
-      return res.status(400).json({
-        message: `Bid must be ≥ ${minValidBid.toFixed(2)} (${FRAUD_RULES.MIN_BID_INCREASE * 100}%)`
+  await bid.save();
+
+  // Simulate blockchain transaction (in production, integrate with actual blockchain)
+  const lockResult = {
+    transactionHash: `0x${require('crypto').randomBytes(32).toString('hex')}`,
+    blockNumber: Math.floor(Math.random() * 1000000),
+    gasUsed: Math.floor(Math.random() * 100000)
+  };
+
+  // Update bid with blockchain info
+  bid.blockchain.transactionHash = lockResult.transactionHash;
+  bid.blockchain.blockNumber = lockResult.blockNumber;
+  bid.blockchain.isOnChain = true;
+  bid.status = 'active';
+  await bid.save();
+
+  // Mark previous highest bidder as outbid
+  if (auction.bidding.highestBidder.userId) {
+    await Bid.updateMany(
+      {
+        'auction.auctionRef': auction._id,
+        'bidder.userId': auction.bidding.highestBidder.userId,
+        status: 'winning'
+      },
+      { status: 'outbid' }
+    );
+  }
+
+  // Update auction with new highest bid
+  await auction.placeBid(amount, {
+    userId: req.user.userId,
+    anonymousId: req.user.anonymousId,
+    walletAddress: req.user.walletAddress
+  });
+
+  // Mark current bid as winning
+  bid.status = 'winning';
+  await bid.save();
+
+  // Create token transaction record
+  const tokenTransaction = new TokenTransaction({
+    type: 'bid_lock',
+    user: {
+      userId: req.user.userId,
+      walletAddress: req.user.walletAddress,
+      anonymousId: req.user.anonymousId
+    },
+    amount,
+    blockchain: {
+      transactionHash: lockResult.transactionHash,
+      blockNumber: lockResult.blockNumber,
+      gasUsed: lockResult.gasUsed,
+      isConfirmed: true
+    },
+    relatedTo: {
+      type: 'bid',
+      id: bid.bidId,
+      reference: bid._id
+    },
+    status: 'confirmed'
+  });
+
+  await tokenTransaction.save();
+
+  // Broadcast bid update via WebSocket
+  webSocketController.broadcastBidUpdate(auction.auctionId, {
+    bidId: bid.bidId,
+    bidder: bid.bidder.anonymousId,
+    amount: bid.amount,
+    isNewHighest: true,
+    transactionHash: lockResult.transactionHash
+  });
+
+  // Send notification to auction watchers
+  const watchers = await User.find({
+    _id: { $in: auction.watchers.map(w => w.userId) }
+  });
+
+  for (const watcher of watchers) {
+    if (watcher._id.toString() !== userId) {
+      await notificationService.sendNotification({
+        recipient: {
+          userId: watcher._id,
+          anonymousId: watcher.anonymousId
+        },
+        type: 'bid_placed',
+        priority: 'medium',
+        title: 'New Bid on Watched Auction',
+        message: `New bid of ${amount} WKC placed on "${auction.title}"`,
+        data: {
+          auctionId: auction.auctionId,
+          bidAmount: amount,
+          bidder: bid.bidder.anonymousId
+        },
+        channels: {
+          inApp: { enabled: true }
+        }
       });
     }
-    if (user.balance < amount) {
-      return res.status(400).json({ message: 'Insufficient balance' });
-    }
-
-    // Fraud detection: too frequent bids
-    const lastUserBid = await Bid.findOne({ bidder: userId, auction: auctionId }).sort({ createdAt: -1 });
-    if (lastUserBid && (Date.now() - lastUserBid.createdAt.getTime()) < FRAUD_RULES.TOO_FAST_BIDS) {
-      return res.status(429).json({ message: 'Bid too fast. Wait 5 seconds.' });
-    }
-
-    // Create pending bid
-    bid = await Bid.create({
-      auction: auctionId,
-      bidder: userId,
-      amount,
-      status: 'pending',
-      flaggedForReview: amount > auction.currentPrice * FRAUD_RULES.SUSPICIOUS_JUMP_MULTIPLIER,
-    });
-
-    // Escrow tokens and finalize within transaction
-    await escrowBidTokens(bid);
-    const result = await finalizeBidPlacement(bid);
-
-    res.status(201).json({
-      success: true,
-      bidId: bid._id,
-      newPrice: result.newPrice,
-      extendedEndTime: result.extendedEndTime,
-      remainingBalance: result.userBalance,
-      escrowedAmount: bid.amount,
-    });
-
-  } catch (error) {
-    if (bid) await Bid.findByIdAndDelete(bid._id);
-    res.status(500).json({ message: 'Bid failed: ' + error.message });
   }
-};
+
+  logger.auction('bid_placed', auction.auctionId, {
+    bidId: bid.bidId,
+    userId: req.user.userId,
+    amount,
+    transactionHash: lockResult.transactionHash
+  });
+
+  res.status(201).json({
+    success: true,
+    message: 'Bid placed successfully',
+    data: {
+      bid: {
+        id: bid._id,
+        bidId: bid.bidId,
+        amount: bid.amount,
+        status: bid.status,
+        placedAt: bid.timing.placedAt,
+        transactionHash: lockResult.transactionHash
+      },
+      auction: {
+        currentBid: auction.pricing.currentBid,
+        totalBids: auction.bidding.totalBids,
+        endTime: auction.timing.endTime
+      }
+    }
+  });
+});
 
 const finalizeBidPlacement = async (bid) => {
   const session = await mongoose.startSession();
@@ -318,4 +490,9 @@ export const getSuspiciousBids = async (req, res) => {
   } catch (error) {
     res.status(500).json({ message: 'Error fetching suspicious bids: ' + error.message });
   }
+};
+
+module.exports = {
+  placeBid,
+  // ... other exports
 };

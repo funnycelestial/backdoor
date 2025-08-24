@@ -3,6 +3,8 @@ const { body, query, param, validationResult } = require('express-validator');
 const TokenTransaction = require('../models/tokenTransactionModel');
 const User = require('../models/userModel');
 const { auth } = require('../middleware/auth');
+const { paymentLimiter } = require('../middleware/rateLimiter');
+const mobileMoneyController = require('../controllers/mobileMoneyController');
 const { asyncHandler, formatValidationErrors, ValidationError } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
 
@@ -12,25 +14,35 @@ const router = express.Router();
 // @desc    Get available payment methods
 // @access  Private
 router.get('/methods', auth, asyncHandler(async (req, res) => {
-  const paymentMethods = [
-    {
-      id: 'mtn_momo',
-      name: 'MTN Mobile Money',
-      type: 'mobile_money',
-      status: 'active',
-      fees: {
-        percentage: 1.5,
-        minimum: 0.5,
-        maximum: 50
-      },
-      limits: {
-        minimum: 10,
-        maximum: 10000,
-        daily: 50000
-      },
-      processingTime: 'instant',
-      countries: ['GH']
+  // Get real-time provider statuses
+  const providerStatuses = await mobileMoneyController.getAllProviderStatuses();
+  
+  const paymentMethods = Object.entries(providerStatuses).map(([id, status]) => ({
+    id,
+    name: status.name || id.replace('_', ' ').toUpperCase(),
+    type: 'mobile_money',
+    status: status.status,
+    fees: `${status.fees}%`,
+    limits: status.limits,
+    processingTime: status.processingTime || 'instant',
+    countries: ['GH']
+  }));
+
+  // Add bank card option
+  paymentMethods.push({
+    id: 'visa_mastercard',
+    name: 'Visa/Mastercard',
+    type: 'bank_card',
+    status: 'active',
+    fees: '2.9%',
+    limits: {
+      minimum: 50,
+      maximum: 50000,
+      daily: 100000
     },
+    processingTime: '2-3 minutes',
+    countries: ['GH', 'NG', 'KE', 'ZA']
+  });
     {
       id: 'vodafone_cash',
       name: 'Vodafone Cash',
@@ -119,115 +131,13 @@ router.get('/methods', auth, asyncHandler(async (req, res) => {
 // @access  Private
 router.post('/process', [
   auth,
+  paymentLimiter, // Apply payment rate limiting
   body('amount').isFloat({ min: 1 }).withMessage('Amount must be at least 1'),
   body('paymentMethod').isString().withMessage('Payment method is required'),
   body('type').isIn(['deposit', 'withdrawal']).withMessage('Invalid payment type'),
   body('phoneNumber').optional().isMobilePhone('any'),
   body('accountDetails').optional().isObject()
-], asyncHandler(async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json({
-      success: false,
-      message: 'Validation errors',
-      errors: formatValidationErrors(errors)
-    });
-  }
-
-  const { amount, paymentMethod, type, phoneNumber, accountDetails } = req.body;
-
-  // Validate payment method
-  const validMethods = ['mtn_momo', 'vodafone_cash', 'airteltigo', 'telecel_cash', 'visa_mastercard'];
-  if (!validMethods.includes(paymentMethod)) {
-    return res.status(400).json({
-      success: false,
-      message: 'Invalid payment method',
-      data: null
-    });
-  }
-
-  // For withdrawals, check balance
-  if (type === 'withdrawal') {
-    const balanceSummary = await TokenTransaction.getUserBalanceSummary(req.user.userId);
-    if (balanceSummary.available < amount) {
-      return res.status(400).json({
-        success: false,
-        message: 'Insufficient balance',
-        data: null
-      });
-    }
-  }
-
-  // Create transaction record
-  const transaction = new TokenTransaction({
-    type,
-    user: {
-      userId: req.user.userId,
-      walletAddress: req.user.walletAddress,
-      anonymousId: req.user.anonymousId
-    },
-    amount: type === 'withdrawal' ? -amount : amount,
-    status: 'pending',
-    mobileMoneyIntegration: {
-      provider: paymentMethod,
-      phoneNumber,
-      exchangeRate: 1.0,
-      localAmount: amount,
-      localCurrency: 'GHS'
-    },
-    metadata: {
-      source: 'web',
-      ipAddress: req.ip,
-      userAgent: req.get('User-Agent'),
-      initiatedBy: 'user',
-      description: `${type} via ${paymentMethod}`
-    }
-  });
-
-  await transaction.save();
-
-  // Here you would integrate with actual payment processors
-  // For simulation, we'll mark as processing
-  setTimeout(async () => {
-    try {
-      // Simulate payment processing
-      transaction.status = 'confirmed';
-      transaction.blockchain.transactionHash = `0x${require('crypto').randomBytes(32).toString('hex')}`;
-      transaction.blockchain.blockNumber = await web3Service.getCurrentBlockNumber();
-      transaction.blockchain.isConfirmed = true;
-      await transaction.save();
-
-      logger.payment(`${type}_completed`, amount, 'WKC', {
-        userId: req.user.userId,
-        transactionId: transaction.transactionId
-      });
-    } catch (error) {
-      logger.error(`Payment ${type} simulation error:`, error);
-    }
-  }, 5000); // Simulate 5 second processing time
-
-  logger.payment(`${type}_initiated`, amount, 'WKC', {
-    userId: req.user.userId,
-    paymentMethod,
-    transactionId: transaction.transactionId
-  });
-
-  res.status(201).json({
-    success: true,
-    message: `${type} initiated successfully`,
-    data: {
-      transaction: {
-        id: transaction._id,
-        transactionId: transaction.transactionId,
-        amount: transaction.amount,
-        status: transaction.status,
-        paymentMethod,
-        estimatedCompletion: '2-5 minutes',
-        createdAt: transaction.createdAt
-      }
-    }
-  });
-}));
+], require('../controllers/paymentGatewayController').buyTokens);
 
 // @route   GET /api/v1/payments/:id/status
 // @desc    Check payment status

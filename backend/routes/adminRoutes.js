@@ -8,6 +8,13 @@ const Notification = require('../models/notificationModel');
 const { adminAuth, moderatorAuth } = require('../middleware/auth');
 const { asyncHandler, formatValidationErrors, NotFoundError } = require('../middleware/errorHandler');
 const logger = require('../utils/logger');
+const { 
+  getPendingApprovals, 
+  approveAuction, 
+  rejectAuction, 
+  getApprovalQueue, 
+  autoApproveLowRisk 
+} = require('../controllers/adminApprovalController');
 
 const router = express.Router();
 
@@ -246,10 +253,70 @@ router.get('/auctions/pending', [
   });
 }));
 
+// @route   GET /api/v1/admin/pending-approvals
+// @desc    Get pending auction approvals with risk assessment
+// @access  Moderator
+router.get('/pending-approvals', [
+  moderatorAuth,
+  query('page').optional().isInt({ min: 1 }),
+  query('limit').optional().isInt({ min: 1, max: 100 }),
+  query('category').optional().isString(),
+  query('type').optional().isIn(['forward', 'reverse'])
+], getPendingApprovals);
+
+// @route   GET /api/v1/admin/approval-queue
+// @desc    Get prioritized approval queue
+// @access  Moderator
+router.get('/approval-queue', moderatorAuth, getApprovalQueue);
+
+// @route   POST /api/v1/admin/approve-auction/:id
+// @desc    Approve specific auction
+// @access  Moderator
+router.post('/approve-auction/:id', [
+  moderatorAuth,
+  param('id').isMongoId().withMessage('Invalid auction ID'),
+  body('notes').optional().isString().isLength({ max: 500 })
+], approveAuction);
+
+// @route   POST /api/v1/admin/reject-auction/:id
+// @desc    Reject specific auction
+// @access  Moderator
+router.post('/reject-auction/:id', [
+  moderatorAuth,
+  param('id').isMongoId().withMessage('Invalid auction ID'),
+  body('reason').isString().isLength({ min: 10, max: 500 }).withMessage('Rejection reason must be between 10 and 500 characters')
+], rejectAuction);
+
+// @route   POST /api/v1/admin/bulk-approve
+// @desc    Bulk approve auctions
+// @access  Admin
+router.post('/bulk-approve', [
+  adminAuth,
+  body('auctionIds').isArray().withMessage('Auction IDs must be an array'),
+  body('auctionIds.*').isMongoId().withMessage('Invalid auction ID'),
+  body('notes').optional().isString().isLength({ max: 500 })
+], require('../controllers/adminApprovalController').bulkApproveAuctions);
+
+// @route   POST /api/v1/admin/auto-approve
+// @desc    Auto-approve low-risk auctions
+// @access  Admin
+router.post('/auto-approve', [
+  adminAuth,
+  body('dryRun').optional().isBoolean()
+], autoApproveLowRisk);
+
+// @route   GET /api/v1/admin/approval-stats
+// @desc    Get approval statistics
+// @access  Admin
+router.get('/approval-stats', [
+  adminAuth,
+  query('period').optional().isIn(['24h', '7d', '30d'])
+], require('../controllers/adminApprovalController').getApprovalStats);
+
 // @route   POST /api/v1/admin/auctions/:id/approve
 // @desc    Approve auction
 // @access  Moderator
-router.post('/:auctionId/approve', [
+router.post('/auctions/:auctionId/approve', [
   moderatorAuth,
   param('auctionId').isMongoId().withMessage('Invalid auction ID'),
   body('notes').optional().isString().isLength({ max: 500 })
@@ -322,7 +389,7 @@ router.post('/:auctionId/approve', [
 // @route   POST /api/v1/admin/auctions/:id/reject
 // @desc    Reject auction
 // @access  Moderator
-router.post('/:auctionId/reject', [
+router.post('/auctions/:auctionId/reject', [
   moderatorAuth,
   param('auctionId').isMongoId().withMessage('Invalid auction ID'),
   body('reason').isString().isLength({ min: 10, max: 500 }).withMessage('Rejection reason must be between 10 and 500 characters')

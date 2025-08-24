@@ -5,8 +5,10 @@ const Bid = require('../models/bidModel');
 const User = require('../models/userModel');
 const TokenTransaction = require('../models/tokenTransactionModel');
 const { auth, optionalAuth, moderatorAuth } = require('../middleware/auth');
+const { biddingLimiter } = require('../middleware/rateLimiter');
+const { uploadMultiple } = require('../middleware/upload');
 const { asyncHandler, formatValidationErrors, NotFoundError, ValidationError } = require('../middleware/errorHandler');
-const { socketService } = require('../services/socketService');
+const webSocketController = require('../controllers/webSocketController');
 const logger = require('../utils/logger');
 
 const router = express.Router();
@@ -342,6 +344,7 @@ router.get('/:id', [
 // @access  Private
 router.post('/', [
   auth,
+  uploadMultiple('images', 10), // Allow up to 10 images
   body('title').trim().isLength({ min: 5, max: 200 }).withMessage('Title must be between 5 and 200 characters'),
   body('description').trim().isLength({ min: 20, max: 2000 }).withMessage('Description must be between 20 and 2000 characters'),
   body('category').isIn(['electronics', 'fashion', 'home-garden', 'sports', 'automotive', 'books', 'art', 'collectibles', 'services', 'other']).withMessage('Invalid category'),
@@ -353,7 +356,7 @@ router.post('/', [
   body('condition').isIn(['new', 'like-new', 'good', 'fair', 'poor']).withMessage('Invalid condition'),
   body('shippingMethod').optional().isIn(['pickup', 'standard', 'express', 'digital']).withMessage('Invalid shipping method'),
   body('shippingCost').optional().isFloat({ min: 0 }).withMessage('Shipping cost must be non-negative')
-], asyncHandler(async (req, res) => {
+], require('../controllers/auctionController').createAuction);
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
     return res.status(400).json({
@@ -688,12 +691,13 @@ router.post('/:id/close', [
 // @access  Private
 router.post('/:id/bids', [
   auth,
+  biddingLimiter, // Apply bidding rate limit
   param('id').isMongoId().withMessage('Invalid auction ID'),
   body('amount').isFloat({ min: 0.01 }).withMessage('Bid amount must be greater than 0'),
   body('isAutoBid').optional().isBoolean(),
   body('maxAmount').optional().isFloat({ min: 0 }),
   body('increment').optional().isFloat({ min: 0 })
-], asyncHandler(async (req, res) => {
+], require('../controllers/bidController').placeBid);
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
     return res.status(400).json({
